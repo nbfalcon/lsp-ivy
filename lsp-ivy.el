@@ -118,28 +118,25 @@
           (cons string face)
           (cons string face)))
 
-(lsp-defun lsp-ivy--goto-symbol
-  ((&SymbolInformation
-    :location (&Location :uri :range (&Range :start (&Position :line :character)))))
-  "Jump to selected candidate."
-  (find-file (lsp--uri-to-path uri))
-  (goto-char (point-min))
-  (forward-line line)
-  (forward-char character))
+(defun lsp-ivy--prefix (kind)
+  "Return the prefix for symbols of KIND."
+  (if lsp-ivy-show-symbol-kind
+      (-let* ((kind (if (< kind (length lsp-ivy-symbol-kind-to-face)) kind 0))
+              ((prefix . face) (elt lsp-ivy-symbol-kind-to-face kind)))
+        (propertize (format "[%s] " prefix) 'face face))
+    ""))
 
 (lsp-defun lsp-ivy--format-symbol-match
   ((sym &as &SymbolInformation :kind :location (&Location :uri))
    project-root)
   "Convert the match returned by `lsp-mode` into a candidate string."
-  (let* ((sanitized-kind (if (< kind (length lsp-ivy-symbol-kind-to-face)) kind 0))
-         (type (elt lsp-ivy-symbol-kind-to-face sanitized-kind))
-         (typestr (if lsp-ivy-show-symbol-kind
-                      (propertize (format "[%s] " (car type)) 'face (cdr type))
-                    ""))
-         (pathstr (if lsp-ivy-show-symbol-filename
-                      (propertize (format " · %s" (file-relative-name (lsp--uri-to-path uri) project-root))
-                                  'face font-lock-comment-face) "")))
-    (concat typestr (lsp-render-symbol-information sym ".") pathstr)))
+  (let ((pathstr (if lsp-ivy-show-symbol-filename
+                     (propertize (format " · %s" (file-relative-name (lsp--uri-to-path uri) project-root))
+                                 'face font-lock-comment-face) "")))
+    (concat (lsp-ivy--prefix kind)
+            (if (or (null container-name?) (string-empty-p container-name?))
+                (format "%s" name)
+              (format "%s.%s" container-name? name)) pathstr)))
 
 (lsp-defun lsp-ivy--transform-candidate ((symbol-information &as &SymbolInformation :kind)
                                          filter-regexps? workspace-root)
@@ -151,9 +148,18 @@ FILTER-REGEXPS?, otherwise convert it to an `lsp-ivy:FormattedSymbolInformation'
       (when (--all? (string-match-p it textual-representation) filter-regexps?)
         (cons textual-representation symbol-information)))))
 
-(lsp-defun lsp-ivy--workspace-symbol-action ((_ . sym))
-  "Jump to the `cdr' of INPUT0, an `&SymbolInformation'."
-  (lsp-ivy--goto-symbol sym))
+(lsp-defun lsp-ivy--goto-symbol
+  ((&SymbolInformation
+    :location (&Location :uri :range (&Range :start (&Position :line :character)))))
+  "Jump to selected candidate."
+  (find-file (lsp--uri-to-path uri))
+  (goto-char (point-min))
+  (forward-line line)
+  (forward-char character))
+
+(defun lsp-ivy--action (cb)
+  "Return a `lambda' of one argument calling CB on the `cdr'."
+  (lambda (a) (funcall cb (cdr a))))
 
 (defun lsp-ivy--workspace-symbol (workspaces prompt initial-input)
   "Search against WORKSPACES with PROMPT and INITIAL-INPUT."
@@ -190,7 +196,7 @@ FILTER-REGEXPS?, otherwise convert it to an `lsp-ivy:FormattedSymbolInformation'
      :dynamic-collection t
      :require-match t
      :initial-input initial-input
-     :action #'lsp-ivy--workspace-symbol-action
+     :action (lsp-ivy--action #'lsp-ivy--goto-symbol)
      :caller 'lsp-ivy-workspace-symbol)))
 
 ;;;###autoload
@@ -211,6 +217,79 @@ When called with prefix ARG the default selection will be symbol at point."
    (-uniq (-flatten (ht-values (lsp-session-folder->servers (lsp-session)))))
    "Global workspace symbols: "
    (when arg (thing-at-point 'symbol))))
+
+;;; localjump
+
+(defface lsp-ivy-containing-symbol-face '((t :inherit (font-lock-type-face lsp-details-face)))
+  "Face used for the containing symbol in `lsp-ivy-localjump'.")
+
+(defcustom lsp-ivy-localjump-signatures t
+  "Whether `lsp-ivy-localjump' should show signatures."
+  :type 'boolean
+  :group 'lsp-ivy)
+
+(defun lsp-ivy--format-document-symbols (syms &optional parent)
+  "Format SYMS, which have PARENT as the parent string.
+SYMS shall be a list of `&DocumentSymbol'. PARENT shall be the
+name of the common parent of SYMS, propertized with
+`lsp-ivy-containing-symbol-face'."
+  (cl-loop for sym being the elements of syms nconc
+           (-let [(&DocumentSymbol :children? :name :kind) sym]
+             (if (seq-empty-p children?)
+                 (let ((str (concat (lsp-ivy--prefix kind)
+                                    (lsp-render-symbol sym lsp-ivy-localjump-signatures)
+                                    (-some->> parent (concat " ")))))
+                   (list (cons str sym)))
+               (lsp-ivy--format-document-symbols
+                children? (propertize name 'face 'lsp-ivy-containing-symbol-face))))))
+
+(lsp-defun lsp-ivy--symbol-start ((&DocumentSymbol :selection-range :range))
+  "Get the start of a `&DocumentSymbol'.
+Uses either the `:selection-range' (if available) or falls back
+to the `:range'."
+  (lsp--position-to-point (lsp:range-start (or selection-range range))))
+
+(defun lsp-ivy--goto-document-symbol (sym)
+  "Jump to `&DocumentSymbol' SYM."
+  (goto-char (lsp-ivy--symbol-start sym)))
+
+;;;###autoload
+(defun lsp-ivy-localjump ()
+  "`ivy' for LSP document symbols.
+Unlike `lsp-imenu', `lsp-ivy-localjump' only shows the parent
+symbol with each symbol (as in VSCode). This function is mainly
+useful if you want to jump to a local variable and your language
+server provides information about those (e.g. `ccls' and
+`EmmyLua').
+
+Two sort functions are offered: `lsp-ivy-document-symbol-above<',
+`lsp-ivy-document-symbol-nearer<'."
+  (interactive)
+  (ivy-read "Local symbol: "
+            (lsp-ivy--format-document-symbols (lsp--get-document-symbols))
+            :action (lsp-ivy--action #'lsp-ivy--goto-document-symbol)
+            :sort t
+            :caller 'lsp-ivy-localjump))
+
+(defun lsp-ivy-document-symbol-above< (a b)
+  "Compare A and B, preferring earlier and then nearer symbols.
+Prefers symbols that are defined above `point', and then those
+that are nearer to `point'."
+  (let ((pa (lsp-ivy--symbol-start (cdr a)))
+        (pb (lsp-ivy--symbol-start (cdr b))))
+    (cond
+     ((and (<= pa (point)) (> pb (point))) t)
+     ((and (<= pb (point)) (> pa (point))) nil)
+     ;; Either after or below point, so we must use `abs'.
+     (t (< (abs (- (point) pa)) (abs (- (point) pb)))))))
+
+(defun lsp-ivy-document-symbol-nearer< (a b)
+  "Compare A and B, preferring the symbol nearer to `point'."
+  (< (abs (- (point) (lsp-ivy--symbol-start a)))
+     (abs (- (point) (lsp-ivy--symbol-start b)))))
+
+(ivy-configure 'lsp-ivy-localjump
+  :sort-fn #'lsp-ivy-document-symbol-nearer<)
 
 (provide 'lsp-ivy)
 ;;; lsp-ivy.el ends here
